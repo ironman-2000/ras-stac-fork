@@ -1,8 +1,13 @@
-import os
+import os, sys
 from pystac import Item, Asset, Link
 from datetime import datetime
 from pathlib import Path
 import tempfile
+import fsspec
+import sqlite3
+import contextily as ctx
+import geopandas as gpd
+from shapely import wkb
 
 from utils.s3_utils import *
 from utils.s3_utils import init_s3_resources
@@ -103,28 +108,6 @@ def define_hms_file_types():
     return hms_file_types
 
 
-# def init_s3_resources_dotenv():
-#     # Load environment variables from .env file
-#     load_dotenv()
-
-#     # Ensure AWS credentials are loaded
-#     aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
-#     aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
-
-#     if not aws_access_key_id or not aws_secret_access_key:
-#         raise EnvironmentError("AWS credentials are not set in the environment variables")
-
-#     # Instantiate S3 resources
-#     session = boto3.Session(
-#         aws_access_key_id=aws_access_key_id,
-#         aws_secret_access_key=aws_secret_access_key,
-#     )
-
-#     s3_client = session.client("s3")
-#     s3_resource = session.resource("s3")
-#     return session, s3_client, s3_resource
-
-
 def list_keys(s3_client, bucket, prefix, suffix=""):
     """List keys in an S3 bucket with a given prefix and suffix
 
@@ -149,6 +132,84 @@ def list_keys(s3_client, bucket, prefix, suffix=""):
             break
     return keys
 
+
+def extract_geom_bbox(bucket, sqlite_key, spatial_ref):
+    """Extract geometry and bbox from an HMS model's SQLite file
+    
+    args
+        bucket (str): S3 bucket
+        sqlite_key (str): S3 key to the SQLite file
+    
+    returns
+        gdf (geopandas.GeoDataFrame): GeoDataFrame containing the geometry data
+        geometry (dict): Geometry data in dictionary format: {"type": "Polygon", "coordinates": [[[x1, y1], [x2, y2], ...]]}
+        bbox (list): Bounding box coordinates [minx, miny, maxx, maxy]
+        spatial_ref (str): Spatial reference in WKT format
+    """
+
+    try:
+        # open the sqlite file
+        uri = f"s3://{bucket}/{sqlite_key}"
+        connection = open_sqlite_uri(uri)
+
+        # retrieve the subbasins2d table, then the geometry field
+        cursor = connection.cursor()
+        cursor.execute("SELECT GEOMETRY FROM subbasins2d")
+        geometry_data = cursor.fetchall()
+
+        # create a geodataframe from the geometry data
+        gdf = gpd.GeoDataFrame(geometry=[wkb.loads(g[0]) for g in geometry_data])
+
+        # assign the wkt spatial reference to the geodataframe
+        gdf.crs = spatial_ref
+
+        # generate the geometry dictionary
+        geometry = {
+            "type": "Polygon",
+            "coordinates": gdf.geometry[0].exterior.coords.xy,
+        }
+
+        # generate the bounding box
+        bbox = gdf.total_bounds.tolist()
+        return gdf, geometry, bbox
+    except Exception as e:
+        print(f"Error extracting geometry and bbox: {e}")
+        return None, None, None
+
+
+def create_hms_thumbnail(gdf, s3_thumbnail_output_key):
+    """Generate a thumbnail image for an HMS model using the SQLite's geometry data
+    
+    args
+        gdf (geopandas.GeoDataFrame): GeoDataFrame containing the geometry data of the hms model
+        s3_thumnail_output_key (str): S3 key to the thumbnail output
+    
+    returns
+        None
+    """
+
+    try:
+        # open the sqlite file
+        uri = f"s3://{bucket}/{sqlite_key}"
+        connection = open_sqlite_uri(uri)
+
+        # retrieve the subbasins2d table, then the geometry field
+        cursor = connection.cursor()
+        cursor.execute("SELECT GEOMETRY FROM subbasins2d")
+        geometry_data = cursor.fetchall()
+
+        # create a geodataframe from the geometry data
+        gdf = gpd.GeoDataFrame(geometry=[wkb.loads(g[0]) for g in geometry_data])
+
+        return True
+
+    except Exception as e:
+        print(f"Error generating thumbnail: {e}")
+        return False
+
+
+
+
 def open_sqlite_uri(uri: str, fsspec_kwargs: dict = {}, sqlite_kwargs: dict = {}):
     """Open a SQLite file from a URI.
     
@@ -162,9 +223,6 @@ def open_sqlite_uri(uri: str, fsspec_kwargs: dict = {}, sqlite_kwargs: dict = {}
     returns
         sqlite3.Connection: The SQLite file opened from the URI.
     """
-
-    import fsspec
-    import sqlite3
 
     remote_file = fsspec.open(uri, mode="rb", **fsspec_kwargs)
 
@@ -199,13 +257,7 @@ def get_hms_spatial_ref(bucket, sqlite_key):
         # retrieve the spatial_ref_sys table, then the srtext field
         cursor = connection.cursor()
         cursor.execute("SELECT srtext FROM spatial_ref_sys")
-
-        print("Cursor executed")
         spatial_ref = cursor.fetchone()[0]
-
-        print("Spatial reference acquired")
-        # print(spatial_ref)
-        spatial_ref = None
     except Exception as e:
         print(f"Error acquiring spatial reference, returning None: {e}")
         spatial_ref = None
@@ -226,10 +278,14 @@ def open_hms_txt_uri(uri: str, fsspec_kwargs: dict = {}):
         file: The text file opened from the URI.
     """
 
-    import fsspec
-
-    remote_file = fsspec.open(uri, mode="r", **fsspec_kwargs)
-    return remote_file
+    try:
+        remote_file = fsspec.open(uri, mode="r", **fsspec_kwargs)
+        return remote_file
+    except Exception as e:
+        print(f"Error opening hms control file: {e}")
+        remote_file = None
+        sys.exit(1)
+    
 
 
 def get_hms_version(bucket, control_key):
@@ -247,12 +303,17 @@ def get_hms_version(bucket, control_key):
         uri = f"s3://{bucket}/{control_key}"
         control_file = open_hms_txt_uri(uri)
 
+        # Read the contents of the file
+        with control_file as f:
+            contents = f.read()
+
         # retrieve the version from the control file (prefaced by 'Version:')
-        for line in control_file:
+        for line in contents.split("\n"):
             if "Version:" in line:
                 hms_version = line.split(":")[1].strip()
-            else:
-                raise ValueError("Version not found in control file")
+                break
+        else:
+            raise ValueError("Version not found in control file")
     except Exception as e:
         print(f"Error acquiring HMS version, returning None: {e}")
         hms_version = None
@@ -275,12 +336,16 @@ def get_hms_terrain(bucket, terrain_key):
         uri = f"s3://{bucket}/{terrain_key}"
         terrain_file = open_hms_txt_uri(uri)
 
+        # Read the contents of the file
+        with terrain_file as f:
+            contents = f.read()
+
         # retrieve the terrain file name (prefaced by "Elevation File Name:")
-        for line in terrain_file:
+        for line in contents.split("\n"):
+            print(f"terrain file line: {line}")
             if "Elevation File Name:" in line:
                 terrain_file_name = line.split(":")[1].strip()
-            else:
-                raise ValueError("Terrain file name not found in terrain file")
+
     except Exception as e:
         print(f"Error acquiring terrain file, returning None: {e}")
         terrain_file_name = None
@@ -317,21 +382,20 @@ def create_hms_stac_item(
     # session, s3_client, s3_resource = init_s3_resources_dotenv()
 
     # list keys in model folder
-    hms_keys = list_keys(s3_client, bucket_name, model_prefix)
+    try:
+        hms_keys = list_keys(s3_client, bucket_name, model_prefix)
+    except Exception as e:
+        print(f"Error listing model keys: {e}")
+        sys.exit(1)
 
     # define the s3 uri key (parent of the model files)
     s3_uri = f"s3://{bucket_name}/{model_prefix}"
 
     # define the stac item
     item_id = model_name
-    geometry = {
-        "type": "Polygon",
-        "coordinates": [
-            [[-80.0, 37.0], [-80.0, 39.0], [-81.0, 39.0], [-81.0, 37.0], [-80.0, 37.0]]
-        ],
-    }
-    bbox = [-81.0, 37.0, -80.0, 39.0]
-    datetime_var = datetime.now()  # .isoformat()
+    datetime_var = datetime.now()
+
+    # handle spatial reference, geometry, bbox, and thumbnail creation
 
     # get the spatial reference
     sqlite_key = [key for key in hms_keys if key.endswith(".sqlite")]
@@ -340,6 +404,24 @@ def create_hms_stac_item(
         spatial_ref = get_hms_spatial_ref(bucket_name, sqlite_key)
     else:
         spatial_ref = None
+
+    # extract geometry and bbox from sqlite file
+    gdf, geometry, bbox = extract_geom_bbox(bucket_name, sqlite_key, spatial_ref)
+
+    # generate the thumbnail
+    thumbnail_created = create_hms_thumbnail(gdf, stac_thumbnail_prefix)
+
+
+    # geometry = {
+    #     "type": "Polygon",
+    #     "coordinates": [
+    #         [[-80.0, 37.0], [-80.0, 39.0], [-81.0, 39.0], [-81.0, 37.0], [-80.0, 37.0]]
+    #     ],
+    # }
+    # bbox = [-81.0, 37.0, -80.0, 39.0]
+     
+
+
 
     # get the hms version
     control_key = [key for key in hms_keys if key.endswith(".control")]
@@ -356,7 +438,6 @@ def create_hms_stac_item(
         terrain_file_name = get_hms_terrain(bucket_name, terrain_key)
     
     # set properties
-    # properties = {"model_name": model_name}
     properties = {"model_name": model_name,
                   "hms_version": hms_version,
                   "spatial_reference": spatial_ref,
@@ -433,13 +514,13 @@ def create_hms_stac_item(
     item.validate()
 
     # write the item to the stac_output_prefix
-    # copy_item_to_s3(item, stac_output_prefix, s3_client)
+    copy_item_to_s3(item, stac_output_prefix, s3_client)
 
-    # write the item locally
-    item_path = f"{model_name}.json"
-    stac_dict = item.to_dict()
-    with open(item_path, "w") as f:
-        json.dump(stac_dict, f)
+    # # write the item locally
+    # item_path = f"{model_name}.json"
+    # stac_dict = item.to_dict()
+    # with open(item_path, "w") as f:
+    #     json.dump(stac_dict, f)
 
 
 
@@ -450,7 +531,7 @@ if __name__ == "__main__":
     # USER INPUTS
 
     # model info
-    model_name = "KanawhaHMS"  # for lableing the stac item
+    model_name = "KanawhaHMS"  # for labeling the stac item
     bucket_name = "kanawha-pilot"
     model_prefix = (
         "FFRD_Kanawha_Compute/hms/"  # parent key of the individual hms model files
@@ -470,12 +551,16 @@ if __name__ == "__main__":
     )
 
     # ITEM CREATION
-
-    create_hms_stac_item(
-        model_name,
-        bucket_name,
-        model_prefix,
-        parent_collection,
-        stac_item_s3_path,
-        png_output_s3_path,
-    )
+    try:
+        create_hms_stac_item(
+            model_name,
+            bucket_name,
+            model_prefix,
+            parent_collection,
+            stac_item_s3_path,
+            png_output_s3_path,
+        )
+        print(f"Successfully created HMS STAC item for {model_name}")
+    except Exception as e:
+        print(f"Error creating HMS STAC item: {e}")
+        sys.exit(1)
