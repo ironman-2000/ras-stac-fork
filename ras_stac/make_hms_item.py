@@ -6,6 +6,7 @@ import tempfile
 import fsspec
 import sqlite3
 import contextily as ctx
+import matplotlib.pyplot as plt
 import geopandas as gpd
 from shapely import wkb
 
@@ -13,6 +14,7 @@ from utils.s3_utils import *
 from utils.s3_utils import init_s3_resources
 
 
+# import json
 
 def define_hms_file_types():
     """Define the HMS file types and their descriptions in a dictionary for use in STAC item creation"""
@@ -151,10 +153,13 @@ def extract_geom_bbox(bucket, sqlite_key, spatial_ref):
         # open the sqlite file
         uri = f"s3://{bucket}/{sqlite_key}"
         connection = open_sqlite_uri(uri)
-
+        
         # retrieve the subbasins2d table, then the geometry field
         cursor = connection.cursor()
-        cursor.execute("SELECT GEOMETRY FROM subbasins2d")
+        # Print available tables
+        tables = cursor.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+        print(f"Tables: {tables}")
+        cursor.execute("SELECT GEOMETRY FROM subbasin2d")
         geometry_data = cursor.fetchall()
 
         # create a geodataframe from the geometry data
@@ -177,16 +182,17 @@ def extract_geom_bbox(bucket, sqlite_key, spatial_ref):
         return None, None, None
 
 
-def create_hms_thumbnail(gdf, s3_thumbnail_output_key):
+def create_hms_thumbnail(bucket, sqlite_key):
     """Generate a thumbnail image for an HMS model using the SQLite's geometry data
     
     args
-        gdf (geopandas.GeoDataFrame): GeoDataFrame containing the geometry data of the hms model
-        s3_thumnail_output_key (str): S3 key to the thumbnail output
+        bucket (str): S3 bucket name
+        sqlite_key (str): S3 key to the SQLite file
     
     returns
         None
     """
+
 
     try:
         # open the sqlite file
@@ -195,17 +201,40 @@ def create_hms_thumbnail(gdf, s3_thumbnail_output_key):
 
         # retrieve the subbasins2d table, then the geometry field
         cursor = connection.cursor()
-        cursor.execute("SELECT GEOMETRY FROM subbasins2d")
+        cursor.execute("SELECT GEOMETRY FROM subbasin2d")
         geometry_data = cursor.fetchall()
 
         # create a geodataframe from the geometry data
         gdf = gpd.GeoDataFrame(geometry=[wkb.loads(g[0]) for g in geometry_data])
 
-        return True
+        # Get the spatial reference
+        spatial_ref = get_hms_spatial_ref(bucket, sqlite_key)
+        if spatial_ref:
+            gdf.crs = spatial_ref
+        else:
+            # Set the crs to EPSG:4326 if spatial reference is not found
+            gdf.crs = "EPSG:4326"
+        
+        # Plot the GeoDataFrame with a basemap
+        ax = gdf.plot(figsize=(10, 10), alpha=0.5, edgecolor="k")
+        ctx.add_basemap(ax, crs=gdf.crs.to_string())
+
+        # Save the plot as a local file
+        thumbnail_path = 'thumbnail.png'
+        plt.savefig(thumbnail_path, bbox_inches='tight')
+        plt.close()
+
+        # Hardcode the HTTP URI of the uploaded thumbnail
+        thumbnail_uri = "https://arcopendata.s3.us-west-2.amazonaws.com/thumbnail.png"
+
+        # Return the local file path of the thumbnail
+        return thumbnail_uri
 
     except Exception as e:
         print(f"Error generating thumbnail: {e}")
-        return False
+        return None
+
+
 
 
 
@@ -339,6 +368,8 @@ def get_hms_terrain(bucket, terrain_key):
         # Read the contents of the file
         with terrain_file as f:
             contents = f.read()
+        
+        terrain_file_name = None
 
         # retrieve the terrain file name (prefaced by "Elevation File Name:")
         for line in contents.split("\n"):
@@ -360,6 +391,7 @@ def create_hms_stac_item(
     parent_collection,
     stac_output_prefix,
     stac_thumbnail_prefix,
+    sqlite_key
 ):
     """Create a STAC item for a given HMS model and upload to s3
     
@@ -409,39 +441,36 @@ def create_hms_stac_item(
     gdf, geometry, bbox = extract_geom_bbox(bucket_name, sqlite_key, spatial_ref)
 
     # generate the thumbnail
-    thumbnail_created = create_hms_thumbnail(gdf, stac_thumbnail_prefix)
+    # thumbnail_uri = create_hms_thumbnail(bucket_name, sqlite_key)
+    thumbnail_uri = None
 
-
-    # geometry = {
-    #     "type": "Polygon",
-    #     "coordinates": [
-    #         [[-80.0, 37.0], [-80.0, 39.0], [-81.0, 39.0], [-81.0, 37.0], [-80.0, 37.0]]
-    #     ],
-    # }
-    # bbox = [-81.0, 37.0, -80.0, 39.0]
-     
-
-
-
-    # get the hms version
-    control_key = [key for key in hms_keys if key.endswith(".control")]
-    if control_key:
-        control_key = control_key[0]
-        hms_version = get_hms_version(bucket_name, control_key)
+    # Get the HMS version
+    control_files = [key for key in hms_keys if key.endswith(".control")]
+    if control_files:
+        control_key = control_files[0]
+        hms_version = get_hms_version(bucket_name, control_key) 
     else:
         hms_version = None
 
-    # get the hms terrain
-    terrain_key = [key for key in hms_keys if key.endswith(".terrain")]
-    if terrain_key:
-        terrain_key = terrain_key[0]
+
+    # Get the HMS terrain file
+    terrain_files = [key for key in hms_keys if key.endswith(".terrain")]
+    if terrain_files:
+        terrain_key = terrain_files[0]
         terrain_file_name = get_hms_terrain(bucket_name, terrain_key)
-    
-    # set properties
-    properties = {"model_name": model_name,
-                  "hms_version": hms_version,
-                  "spatial_reference": spatial_ref,
-                  "terrain_file": terrain_file_name}
+    else:
+        terrain_file_name = None
+
+
+
+    item_id = model_name
+    datetime_var = datetime.now()
+    properties = {
+        "model_name": model_name,
+        "hms_version": hms_version,
+        "spatial_reference": spatial_ref,
+        "terrain_file": terrain_file_name,
+    }
 
     item = Item(
         id=item_id,
@@ -451,6 +480,19 @@ def create_hms_stac_item(
         properties=properties,
         collection=parent_collection
     )
+
+    if thumbnail_uri:
+        item.add_asset(
+            "thumbnail",
+            Asset(
+                href=thumbnail_uri,
+                media_type="image/png",
+                roles=["thumbnail"],
+                title="Thumbnail Image",
+            ),
+        )
+
+
 
     # add hms assets to item
     hms_assets_dict = define_hms_file_types()
@@ -551,6 +593,8 @@ if __name__ == "__main__":
     )
 
     # ITEM CREATION
+    # Define the sqlite_key
+    sqlite_key = 'FFRD_Kanawha_Compute/hms/KanawhaCWMS___1996.sqlite'
     try:
         create_hms_stac_item(
             model_name,
@@ -559,6 +603,7 @@ if __name__ == "__main__":
             parent_collection,
             stac_item_s3_path,
             png_output_s3_path,
+            sqlite_key,
         )
         print(f"Successfully created HMS STAC item for {model_name}")
     except Exception as e:
