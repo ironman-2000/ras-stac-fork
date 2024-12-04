@@ -169,9 +169,11 @@ def extract_geom_bbox(bucket, sqlite_key, spatial_ref):
         gdf.crs = spatial_ref
 
         # generate the geometry dictionary
+        coordinates = [list(map(list, gdf.geometry[0].exterior.coords))]
         geometry = {
             "type": "Polygon",
-            "coordinates": gdf.geometry[0].exterior.coords.xy,
+        #    "coordinates": gdf.geometry[0].exterior.coords.xy,
+            "coordinates": coordinates,
         }
 
         # generate the bounding box
@@ -441,8 +443,8 @@ def create_hms_stac_item(
     gdf, geometry, bbox = extract_geom_bbox(bucket_name, sqlite_key, spatial_ref)
 
     # generate the thumbnail
-    # thumbnail_uri = create_hms_thumbnail(bucket_name, sqlite_key)
-    thumbnail_uri = None
+    thumbnail_uri = create_hms_thumbnail(bucket_name, sqlite_key)
+    # thumbnail_uri = None
 
     # Get the HMS version
     control_files = [key for key in hms_keys if key.endswith(".control")]
