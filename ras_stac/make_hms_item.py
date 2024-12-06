@@ -13,8 +13,24 @@ from shapely import wkb
 from utils.s3_utils import *
 from utils.s3_utils import init_s3_resources
 
-
+import boto3
 # import json
+def copy_thumbnail_to_s3(thumbnail_path, bucket, thumbnail_prefix, s3_client):
+        """Copy the thumbnail to s3
+
+        args
+            thumbnail_path (str): local path to the thumbnail
+            bucket (str): s3 bucket name
+            thumbnail_prefix (str): s3 prefix for the thumbnail
+            s3_client (boto3.client): s3 client
+        """
+
+        # upload the thumbnail to s3
+        try:
+            s3_client.upload_file(thumbnail_path, bucket, thumbnail_prefix)
+        except Exception as e:
+            print(f"Error uploading thumbnail to s3: {e}")
+            sys.exit(1)
 
 def define_hms_file_types():
     """Define the HMS file types and their descriptions in a dictionary for use in STAC item creation"""
@@ -182,6 +198,36 @@ def extract_geom_bbox(bucket, sqlite_key, spatial_ref):
     except Exception as e:
         print(f"Error extracting geometry and bbox: {e}")
         return None, None, None
+    
+
+# def upload_thumbnail_to_arcopendata(thumbnail_path):
+#     """Upload the thumbnail to the arcopendata s3 bucket
+    
+#     args
+#         thumbnail_path (str): local path to the thumbnail
+    
+#     returns
+#         thumbnail_uri (str): URI of the uploaded thumbnail
+#     """
+#     try:
+#         # define the ArcopenData s3 bucket and thumbnail path
+#         arcopendata_bucket = "arcopendata"
+#         thumbnail_s3_key = "thumbnail.png"
+
+#         # Create an S3 client
+#         s3_client = boto3.client("s3")
+
+#         # upload the thumbnail to s3
+#         s3_client.upload_file(thumbnail_path, arcopendata_bucket, thumbnail_s3_key)
+#         thumbnail_uri = f"https://{arcopendata_bucket}.s3.us-west-2.amazonaws.com/{thumbnail_s3_key}"
+#         print(f"Thumbnail uploaded to: {thumbnail_uri}")
+#         return thumbnail_uri
+    
+#     except Exception as e:
+#         print(f"Error uploading thumbnail to s3: {e}")
+        
+
+#     return None
 
 
 def create_hms_thumbnail(bucket, sqlite_key):
@@ -228,9 +274,9 @@ def create_hms_thumbnail(bucket, sqlite_key):
 
         # Hardcode the HTTP URI of the uploaded thumbnail
         thumbnail_uri = "https://arcopendata.s3.us-west-2.amazonaws.com/thumbnail.png"
-
+        # thumbnail_uri = upload_thumbnail_to_arcopendata(thumbnail_path)
         # Return the local file path of the thumbnail
-        return thumbnail_uri
+        return thumbnail_uri, thumbnail_path
 
     except Exception as e:
         print(f"Error generating thumbnail: {e}")
@@ -443,9 +489,11 @@ def create_hms_stac_item(
     gdf, geometry, bbox = extract_geom_bbox(bucket_name, sqlite_key, spatial_ref)
 
     # generate the thumbnail
-    thumbnail_uri = create_hms_thumbnail(bucket_name, sqlite_key)
-    # thumbnail_uri = None
+    thumbnail_uri, thumbnail_path = create_hms_thumbnail(bucket_name, sqlite_key)
 
+    print(f"thumbnail_uri: {thumbnail_uri}")
+
+    
     # Get the HMS version
     control_files = [key for key in hms_keys if key.endswith(".control")]
     if control_files:
@@ -557,9 +605,17 @@ def create_hms_stac_item(
     # validate the item, returning an error if not valid
     item.validate()
 
-    # write the item to the stac_output_prefix
-    # copy_item_to_s3(item, stac_output_prefix, s3_client)
 
+    
+
+    # write the item to the stac_output_prefix
+    try: 
+        copy_item_to_s3(item, stac_output_prefix, s3_client)
+        copy_thumbnail_to_s3(thumbnail_path, bucket_name, thumbnail_uri, s3_client)
+    except Exception as e:
+        print(f"Error copying item to s3: {e}")
+        #sys.exit(1)
+    
     # # write the item locally
     item_path = f"{model_name}.json"
     stac_dict = item.to_dict()
